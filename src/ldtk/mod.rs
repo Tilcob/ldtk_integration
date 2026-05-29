@@ -2,6 +2,7 @@ pub mod commands;
 pub mod core;
 pub mod level_manager;
 pub mod plugins;
+pub mod validation;
 
 pub mod prelude {
     pub use crate::ldtk::commands::LdtkAppExt;

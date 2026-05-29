@@ -106,6 +106,58 @@ impl LdtkConfig {
     }
 }
 
+/// Strategy for fetching the JSON of an external `.ldtkl` level file during
+/// catalog construction. Injecting this keeps blocking filesystem I/O out of the
+/// plugin core: the desktop default reads from disk, WASM gets nothing, and a
+/// consumer can supply their own (e.g. an async-prefetched cache) by replacing
+/// the [`LdtkExternalLevelSource`] resource.
+pub trait ExternalLevelSource: Send + Sync + 'static {
+    /// Returns the raw JSON text of the external level, or `None` if it cannot
+    /// be provided. `world_path` is the asset-relative path of the `.ldtk` file,
+    /// `rel_path` the level's `external_rel_path` relative to that file.
+    fn load(&self, asset_root: &str, world_path: &str, rel_path: &str) -> Option<String>;
+}
+
+/// Resource holding the active external-level loader. `None` disables external
+/// level cataloging (the default on targets without filesystem access).
+#[derive(Resource, Default)]
+pub struct LdtkExternalLevelSource(pub Option<Box<dyn ExternalLevelSource>>);
+
+impl LdtkExternalLevelSource {
+    pub fn source(&self) -> Option<&dyn ExternalLevelSource> {
+        self.0.as_deref()
+    }
+}
+
+/// Joins the asset root, the world file's directory and the level's relative
+/// path into the on-disk location of an external `.ldtkl` file.
+#[cfg(feature = "external-level-fs")]
+pub fn external_level_path(
+    asset_root: &str,
+    active_world_path: &str,
+    external_path: &str,
+) -> std::path::PathBuf {
+    let world_dir = std::path::Path::new(active_world_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    std::path::Path::new(asset_root)
+        .join(world_dir)
+        .join(external_path)
+}
+
+/// Default [`ExternalLevelSource`] that reads external levels synchronously from
+/// the filesystem. Only available with the `external-level-fs` feature.
+#[cfg(feature = "external-level-fs")]
+pub struct FsExternalLevelSource;
+
+#[cfg(feature = "external-level-fs")]
+impl ExternalLevelSource for FsExternalLevelSource {
+    fn load(&self, asset_root: &str, world_path: &str, rel_path: &str) -> Option<String> {
+        let full_path = external_level_path(asset_root, world_path, rel_path);
+        std::fs::read_to_string(full_path).ok()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LdtkCollisionRule {
     pub layer_identifier: Option<String>,
@@ -191,6 +243,19 @@ impl LdtkValidationReport {
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
+
+    /// Records an issue, routing it to [`Self::errors`] when `strict` is set and
+    /// to [`Self::warnings`] otherwise. This is the single place that encodes the
+    /// "strict promotes warnings to errors" policy, so callers no longer repeat
+    /// the branch at every check.
+    pub fn push(&mut self, strict: bool, code: impl Into<String>, message: impl Into<String>) {
+        let issue = LdtkValidationIssue::new(code, message);
+        if strict {
+            self.errors.push(issue);
+        } else {
+            self.warnings.push(issue);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,14 +265,10 @@ pub struct LdtkValidationIssue {
 }
 
 impl LdtkValidationIssue {
-    pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-        }
-    }
-
-    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+    /// Severity is not stored on the issue itself; it is conveyed by which list
+    /// of [`LdtkValidationReport`] the issue ends up in. Use
+    /// [`LdtkValidationReport::push`] rather than constructing-and-placing by hand.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -236,7 +297,12 @@ pub enum LdtkTransitionState {
 #[derive(Debug, Clone, Resource, Default)]
 pub struct LdtkMapCatalog {
     pub worlds: HashMap<String, LdtkWorldInfo>,
+    /// Levels keyed by their LDtk `identifier`.
     pub levels: HashMap<String, LdtkLevelInfo>,
+    /// Secondary index mapping a level `iid` to its `identifier`, so lookups by
+    /// iid are O(1) instead of a linear scan over [`Self::levels`]. Kept in sync
+    /// by [`Self::insert_level_info`].
+    pub levels_by_iid: HashMap<String, String>,
     pub layers: HashMap<String, LdtkLayerInfo>,
     pub tilesets: HashMap<i32, LdtkTilesetInfo>,
     pub tile_animations: HashMap<LdtkTileKey, LdtkTileAnimation>,
@@ -246,6 +312,28 @@ impl LdtkMapCatalog {
     pub fn is_empty(&self) -> bool {
         self.worlds.is_empty() && self.levels.is_empty()
     }
+
+    /// Inserts a level while keeping the `iid -> identifier` index in sync.
+    pub fn insert_level_info(&mut self, info: LdtkLevelInfo) {
+        self.levels_by_iid
+            .insert(info.iid.clone(), info.identifier.clone());
+        self.levels.insert(info.identifier.clone(), info);
+    }
+
+    /// Resolves an `iid` to the level `identifier` in O(1).
+    pub fn identifier_for_iid(&self, iid: &str) -> Option<&str> {
+        self.levels_by_iid.get(iid).map(String::as_str)
+    }
+
+    /// Looks up a level by either its `identifier` or its `iid`.
+    pub fn level_by_id_or_iid(&self, id: &str) -> Option<&LdtkLevelInfo> {
+        if let Some(level) = self.levels.get(id) {
+            return Some(level);
+        }
+        self.levels_by_iid
+            .get(id)
+            .and_then(|identifier| self.levels.get(identifier))
+    }
 }
 
 #[derive(Debug, Clone, Resource, Default)]
@@ -254,13 +342,38 @@ pub struct LdtkCollisionCatalog {
     pub cells: Vec<LdtkCollisionCell>,
 }
 
+/// Strongly typed mirror of `bevy_ecs_ldtk`'s layer kind, so consumers match on
+/// a stable enum instead of a `format!("{:?}", ...)` debug string that silently
+/// breaks if the upstream `Debug` impl changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LdtkLayerType {
+    IntGrid,
+    Entities,
+    Tiles,
+    AutoLayer,
+    #[default]
+    Unknown,
+}
+
+impl From<bevy_ecs_ldtk::ldtk::Type> for LdtkLayerType {
+    fn from(value: bevy_ecs_ldtk::ldtk::Type) -> Self {
+        use bevy_ecs_ldtk::ldtk::Type;
+        match value {
+            Type::IntGrid => Self::IntGrid,
+            Type::Entities => Self::Entities,
+            Type::Tiles => Self::Tiles,
+            Type::AutoLayer => Self::AutoLayer,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LdtkCollisionLayerInfo {
     pub level_identifier: String,
     pub level_iid: String,
     pub layer_identifier: String,
     pub layer_iid: String,
-    pub layer_type: String,
+    pub layer_type: LdtkLayerType,
     pub solid_cells: usize,
     pub tile_cells: usize,
     pub sensor_cells: usize,
@@ -307,7 +420,7 @@ pub struct LdtkLayerInfo {
     pub iid: String,
     pub identifier: String,
     pub level_identifier: String,
-    pub layer_type: String,
+    pub layer_type: LdtkLayerType,
     pub grid_size: i32,
     pub grid_size_cells: IVec2,
     pub tileset_uid: Option<i32>,
@@ -347,7 +460,7 @@ pub enum LdtkDirection {
     West,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LdtkWorldLayout {
     #[default]
     Free,
@@ -461,7 +574,9 @@ pub struct LdtkTileMetadata {
     pub tile_id: i32,
     pub layer_position: IVec2,
     pub source_position: IVec2,
-    pub rotation_degrees: u16,
+    // LDtk tiles carry no native rotation, only flip flags. A 180° rotation is
+    // simply `flip_x && flip_y`; consumers derive that themselves instead of us
+    // shipping a redundant (and previously incorrect) `rotation_degrees` field.
     pub flip_x: bool,
     pub flip_y: bool,
     pub alpha: f32,
@@ -636,16 +751,10 @@ pub struct LdtkTileCollision {
     pub solid: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub enum LdtkCommand {
-    #[default]
-    None,
-    SpawnWorld {
-        world_path: String,
-    },
-    ChangeLevel {
-        level_identifier: String,
-    },
+    SpawnWorld { world_path: String },
+    ChangeLevel { level_identifier: String },
     ReloadWorld,
     UnloadWorld,
 }
@@ -959,113 +1068,48 @@ mod tests {
         assert!(!config.should_include_layer("Background"));
         assert!(!config.should_include_layer("Debug"));
     }
-}
 
-pub(crate) fn validate_catalog(
-    catalog: &LdtkMapCatalog,
-    registry: &LdtkEntityRegistry,
-    config: &LdtkConfig,
-    report: &mut LdtkValidationReport,
-) {
-    report.clear();
+    #[test]
+    fn catalog_resolves_levels_by_identifier_and_iid() {
+        let mut catalog = LdtkMapCatalog::default();
+        let info = LdtkLevelInfo {
+            iid: "abc-123".to_string(),
+            identifier: "Level_A".to_string(),
+            ..Default::default()
+        };
+        catalog.insert_level_info(info);
 
-    for level in catalog.levels.values() {
-        if level.external_path.is_some() && level.tiles.is_empty() && level.entities.is_empty() {
-            let issue = LdtkValidationIssue::warning(
-                "external_level_not_cataloged",
-                format!(
-                    "Level '{}' references an external .ldtkl file. bevy_ecs_ldtk can load it, but this metadata catalog only sees embedded layer data.",
-                    level.identifier
-                ),
-            );
-            if config.strict_validation {
-                report
-                    .errors
-                    .push(LdtkValidationIssue::error(issue.code, issue.message));
-            } else {
-                report.warnings.push(issue);
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        if level.external_path.is_some() {
-            let issue = LdtkValidationIssue::warning(
-                "external_level_wasm_unsupported",
-                format!(
-                    "Level '{}' references an external .ldtkl file. The metadata catalog skips external levels on wasm32; use embedded levels or custom IO.",
-                    level.identifier
-                ),
-            );
-            if config.strict_validation {
-                report
-                    .errors
-                    .push(LdtkValidationIssue::error(issue.code, issue.message));
-            } else {
-                report.warnings.push(issue);
-            }
-        }
-
-        if level.spawn_points.is_empty() {
-            let issue = LdtkValidationIssue::warning(
-                "missing_spawn_point",
-                format!(
-                    "Level '{}' has no entity tagged/named as spawn.",
-                    level.identifier
-                ),
-            );
-            if config.strict_validation {
-                report
-                    .errors
-                    .push(LdtkValidationIssue::error(issue.code, issue.message));
-            } else {
-                report.warnings.push(issue);
-            }
-        }
-
-        if config.warn_on_unregistered_entities {
-            for entity in &level.entities {
-                if registry
-                    .resolve(
-                        entity.layer_identifier.as_deref(),
-                        &entity.entity_identifier,
-                    )
-                    .is_none()
-                {
-                    let issue = LdtkValidationIssue::warning(
-                        "unregistered_entity",
-                        format!(
-                            "LDtk entity '{}' in level '{}' has no registered bundle/spawner.",
-                            entity.entity_identifier, level.identifier
-                        ),
-                    );
-                    if config.strict_validation {
-                        report
-                            .errors
-                            .push(LdtkValidationIssue::error(issue.code, issue.message));
-                    } else {
-                        report.warnings.push(issue);
-                    }
-                }
-            }
-        }
+        assert_eq!(catalog.identifier_for_iid("abc-123"), Some("Level_A"));
+        assert_eq!(
+            catalog
+                .level_by_id_or_iid("Level_A")
+                .map(|l| l.iid.as_str()),
+            Some("abc-123")
+        );
+        assert_eq!(
+            catalog
+                .level_by_id_or_iid("abc-123")
+                .map(|l| l.identifier.as_str()),
+            Some("Level_A")
+        );
+        assert!(catalog.level_by_id_or_iid("missing").is_none());
     }
 
-    for layer in catalog.layers.values() {
-        if layer.tileset_uid.is_some() && layer.tileset_rel_path.is_none() {
-            let issue = LdtkValidationIssue::warning(
-                "missing_tileset_path",
-                format!(
-                    "Layer '{}' in level '{}' references a tileset without a relative path.",
-                    layer.identifier, layer.level_identifier
-                ),
-            );
-            if config.strict_validation {
-                report
-                    .errors
-                    .push(LdtkValidationIssue::error(issue.code, issue.message));
-            } else {
-                report.warnings.push(issue);
-            }
-        }
+    #[cfg(feature = "external-level-fs")]
+    #[test]
+    fn builds_external_level_path_relative_to_world_file() {
+        let path = external_level_path(
+            "assets",
+            "worlds/SeparateLevelFiles.ldtk",
+            "SeparateLevelFiles/World_Level_0.ldtkl",
+        );
+
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("assets")
+                .join("worlds")
+                .join("SeparateLevelFiles")
+                .join("World_Level_0.ldtkl")
+        );
     }
 }

@@ -4,10 +4,10 @@ use bevy_ecs_ldtk::ldtk::{
 };
 use bevy_ecs_ldtk::prelude::*;
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::ldtk::core::*;
+use crate::ldtk::validation::validate_catalog;
 
 pub struct GameLdtkPlugin {
     pub config: LdtkConfig,
@@ -63,8 +63,18 @@ impl Plugin for GameLdtkPlugin {
                     LdtkLoadSet::Animation,
                 )
                     .chain(),
-            )
-            .add_systems(Startup, spawn_configured_world)
+            );
+
+        // External level loader: filesystem-backed by default (desktop), absent
+        // when the `external-level-fs` feature is off (e.g. WASM builds).
+        #[cfg(feature = "external-level-fs")]
+        app.insert_resource(LdtkExternalLevelSource(Some(Box::new(
+            FsExternalLevelSource,
+        ))));
+        #[cfg(not(feature = "external-level-fs"))]
+        app.init_resource::<LdtkExternalLevelSource>();
+
+        app.add_systems(Startup, spawn_configured_world)
             .add_systems(
                 Update,
                 (
@@ -163,7 +173,6 @@ fn process_ldtk_commands(
                 *selection = LevelSelection::default();
                 unload_messages.write(LdtkWorldUnloadedEvent);
             }
-            LdtkCommand::None => {}
         }
     }
 }
@@ -187,6 +196,7 @@ fn refresh_map_catalog_from_project(
     mut runtime: ResMut<'_, LdtkRuntimeState>,
     registry: Res<'_, LdtkEntityRegistry>,
     config: Res<'_, LdtkConfig>,
+    external_source: Res<'_, LdtkExternalLevelSource>,
     mut load_state: ResMut<'_, LdtkLoadState>,
     mut validation: ResMut<'_, LdtkValidationReport>,
     mut map_messages: MessageWriter<'_, LdtkMapLoadedEvent>,
@@ -208,9 +218,11 @@ fn refresh_map_catalog_from_project(
 
     let json = project.json_data();
     let active_world_path = runtime.active_world_path.clone().unwrap_or_default();
+    let external_source = external_source.source();
 
     catalog.worlds.clear();
     catalog.levels.clear();
+    catalog.levels_by_iid.clear();
     catalog.layers.clear();
     catalog.tilesets = extract_tilesets(json);
     catalog.tile_animations = catalog
@@ -250,8 +262,9 @@ fn refresh_map_catalog_from_project(
         );
 
         for level in &json.levels {
-            let level = level_with_external_data(level, &active_world_path, &config)
-                .unwrap_or_else(|| level.clone());
+            let level =
+                level_with_external_data(level, &active_world_path, &config, external_source)
+                    .unwrap_or_else(|| level.clone());
             insert_level(
                 &level,
                 &world_identifier,
@@ -278,20 +291,15 @@ fn refresh_map_catalog_from_project(
                     identifier: world.identifier.clone(),
                     path: active_world_path.clone(),
                     levels: level_identifiers,
-                    layout: layout.clone(),
+                    layout,
                 },
             );
 
             for level in &world.levels {
-                let level = level_with_external_data(level, &active_world_path, &config)
-                    .unwrap_or_else(|| level.clone());
-                insert_level(
-                    &level,
-                    &world.identifier,
-                    layout.clone(),
-                    &mut catalog,
-                    &config,
-                );
+                let level =
+                    level_with_external_data(level, &active_world_path, &config, external_source)
+                        .unwrap_or_else(|| level.clone());
+                insert_level(&level, &world.identifier, layout, &mut catalog, &config);
             }
         }
     }
@@ -376,39 +384,25 @@ fn insert_level(
         info.neighbors.clear();
     }
 
-    catalog.levels.insert(info.identifier.clone(), info);
+    catalog.insert_level_info(info);
 }
 
-#[cfg(target_arch = "wasm32")]
-fn level_with_external_data(
-    _level: &Level,
-    _active_world_path: &str,
-    _config: &LdtkConfig,
-) -> Option<Level> {
-    None
-}
-
-#[cfg(not(target_arch = "wasm32"))]
+/// Pulls in the layer data of an external `.ldtkl` level via the injected
+/// [`ExternalLevelSource`]. Returns `None` when external cataloging is disabled,
+/// the level is already embedded, or no source is available (e.g. WASM).
 fn level_with_external_data(
     level: &Level,
     active_world_path: &str,
     config: &LdtkConfig,
+    source: Option<&dyn ExternalLevelSource>,
 ) -> Option<Level> {
     if !config.catalog_external_levels || level.layer_instances.is_some() {
         return None;
     }
 
     let external_path = level.external_rel_path.as_ref()?;
-    let full_path = external_level_path(&config.asset_root, active_world_path, external_path);
-    let text = fs::read_to_string(full_path).ok()?;
+    let text = source?.load(&config.asset_root, active_world_path, external_path)?;
     serde_json::from_str::<Level>(&text).ok()
-}
-
-fn external_level_path(asset_root: &str, active_world_path: &str, external_path: &str) -> PathBuf {
-    let world_dir = Path::new(active_world_path)
-        .parent()
-        .unwrap_or_else(|| Path::new(""));
-    Path::new(asset_root).join(world_dir).join(external_path)
 }
 
 fn level_info_from_level(level: &Level, world_identifier: &str) -> LdtkLevelInfo {
@@ -436,7 +430,7 @@ fn layer_info_from_layer(layer: &LayerInstance, level_identifier: &str) -> LdtkL
         iid: layer.iid.clone(),
         identifier: layer.identifier.clone(),
         level_identifier: level_identifier.to_string(),
-        layer_type: format!("{:?}", layer.layer_instance_type),
+        layer_type: LdtkLayerType::from(layer.layer_instance_type),
         grid_size: layer.grid_size,
         grid_size_cells: IVec2::new(layer.c_wid, layer.c_hei),
         tileset_uid: layer.override_tileset_uid.or(layer.tileset_def_uid),
@@ -685,7 +679,6 @@ fn tile_metadata_from_instance(
         tile_id: tile.t,
         layer_position: tile.px,
         source_position: tile.src,
-        rotation_degrees: tile_rotation_from_flags(tile.f),
         flip_x: tile.f & 1 != 0,
         flip_y: tile.f & 2 != 0,
         alpha: tile.a,
@@ -733,7 +726,6 @@ fn extract_entity_snapshots(
                     tile_id,
                     layer_position: entity.px,
                     source_position: IVec2::new(tile.x, tile.y),
-                    rotation_degrees: 0,
                     flip_x: false,
                     flip_y: false,
                     alpha: 1.0,
@@ -818,7 +810,7 @@ fn capture_collision_data(
                 level_iid,
                 layer_identifier: layer.identifier.clone(),
                 layer_iid: layer.iid.clone(),
-                layer_type: format!("{:?}", layer.layer_instance_type),
+                layer_type: LdtkLayerType::from(layer.layer_instance_type),
                 solid_cells: 0,
                 tile_cells: 0,
                 sensor_cells: 0,
@@ -867,7 +859,7 @@ fn capture_collision_data(
                 level_iid,
                 layer_identifier,
                 layer_iid,
-                layer_type: String::from("IntGrid"),
+                layer_type: LdtkLayerType::IntGrid,
                 solid_cells: 0,
                 tile_cells: 0,
                 sensor_cells: 0,
@@ -879,10 +871,9 @@ fn capture_collision_data(
 }
 
 fn resolve_level_reference(catalog: &LdtkMapCatalog, level_id: &str) -> (String, String) {
-    if let Some(level) = catalog.levels.values().find(|level| level.iid == level_id) {
-        return (level.identifier.clone(), level.iid.clone());
-    }
-    if let Some(level) = catalog.levels.get(level_id) {
+    // `level_id` may be either an identifier or an iid; the catalog resolves
+    // both in O(1) via its secondary index.
+    if let Some(level) = catalog.level_by_id_or_iid(level_id) {
         return (level.identifier.clone(), level.iid.clone());
     }
     (level_id.to_string(), level_id.to_string())
@@ -1115,14 +1106,6 @@ fn parse_tile_animation(data: &str) -> Option<LdtkTileAnimation> {
     (!frames.is_empty()).then_some(LdtkTileAnimation { frames, repeat })
 }
 
-fn tile_rotation_from_flags(flags: i32) -> u16 {
-    match flags & 3 {
-        0 | 1 => 0,
-        2 | 3 => 180,
-        _ => 0,
-    }
-}
-
 fn layer_key(level_identifier: &str, layer_identifier: &str) -> String {
     format!("{level_identifier}:{layer_identifier}")
 }
@@ -1192,23 +1175,6 @@ mod tests {
         };
 
         assert_eq!(tile_id_from_rect(&rect, &tileset), Some(6));
-    }
-
-    #[test]
-    fn builds_external_level_path_relative_to_world_file() {
-        let path = external_level_path(
-            "assets",
-            "worlds/SeparateLevelFiles.ldtk",
-            "SeparateLevelFiles/World_Level_0.ldtkl",
-        );
-
-        assert_eq!(
-            path,
-            PathBuf::from("assets")
-                .join("worlds")
-                .join("SeparateLevelFiles")
-                .join("World_Level_0.ldtkl")
-        );
     }
 
     #[test]

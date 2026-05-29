@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::ldtk::core::{
     LdtkCollisionCatalog, LdtkConfig, LdtkEntityMarker, LdtkLoadSet, LdtkLoadState, LdtkLoadStatus,
     LdtkMapCatalog, LdtkPersistent, LdtkRuntimeState, LdtkSpawnPoint, LdtkTileAnimator,
-    LdtkValidationIssue, LdtkValidationReport,
+    LdtkValidationReport,
 };
 #[cfg(feature = "tilemap")]
 use crate::ldtk::core::{LdtkLayerInfo, LdtkLevelInfo, LdtkTileAnimation};
@@ -19,22 +19,26 @@ pub struct LevelManagerPlugin;
 
 impl Plugin for LevelManagerPlugin {
     fn build(&self, app: &mut App) {
+        // The loader-side resources (LdtkRuntimeState, LdtkMapCatalog, LdtkConfig,
+        // ...) are owned by GameLdtkPlugin. LevelManagerPlugin only adds its own
+        // transition state and guards its systems on those resources existing, so
+        // that adding it without GameLdtkPlugin neither panics nor silently does
+        // nothing — it logs a clear error at startup (see check_loader_dependency).
         app.init_resource::<CurrentLdtkLevel>()
             .init_resource::<PendingLdtkLevelTransition>()
             .init_resource::<LevelTransitionState>()
             .init_resource::<LdtkLevelManagerConfig>()
             .init_resource::<LdtkPlayerLocator>()
-            .init_resource::<LdtkConfig>()
-            .init_resource::<LdtkLoadState>()
-            .init_resource::<LdtkValidationReport>()
             .add_message::<LevelTransitionRequest>()
             .add_message::<LdtkLevelReadyEvent>()
             .add_message::<LdtkCollisionReadyEvent>()
+            .add_systems(Startup, check_loader_dependency)
             .add_systems(
                 Update,
                 (handle_transition_requests, finalize_level_transition)
                     .chain()
-                    .in_set(LdtkLoadSet::LevelTransitions),
+                    .in_set(LdtkLoadSet::LevelTransitions)
+                    .run_if(resource_exists::<LdtkRuntimeState>),
             );
 
         #[cfg(feature = "tilemap")]
@@ -47,9 +51,25 @@ impl Plugin for LevelManagerPlugin {
                     apply_tile_animation_to_tilemap,
                 )
                     .chain()
-                    .in_set(LdtkLoadSet::Animation),
+                    .in_set(LdtkLoadSet::Animation)
+                    .run_if(resource_exists::<LdtkMapCatalog>),
             );
         }
+    }
+}
+
+/// Emits a clear error at startup if `LevelManagerPlugin` was added without
+/// `GameLdtkPlugin`. `LdtkRuntimeState` is initialized exclusively by the loader
+/// plugin, so its absence is an unambiguous signal that the dependency is missing
+/// — in which case the transition systems are skipped (see `run_if` above) rather
+/// than panicking on a missing resource.
+fn check_loader_dependency(runtime: Option<Res<'_, LdtkRuntimeState>>) {
+    if runtime.is_none() {
+        error!(
+            "LevelManagerPlugin requires GameLdtkPlugin, which provides LDtk loading and the \
+             LdtkMapCatalog. Without it, level transitions are disabled. Add GameLdtkPlugin to \
+             your App before LevelManagerPlugin."
+        );
     }
 }
 
@@ -178,19 +198,12 @@ fn handle_transition_requests(
             request.spawn_id.clone(),
             &catalog,
         ) {
+            let strict = config.strict_validation;
             state.status = LevelTransitionStatus::Failed;
             state.error = Some(error.clone());
-            if config.strict_validation {
-                validation.errors.push(LdtkValidationIssue::error(
-                    "transition_level_missing",
-                    error.clone(),
-                ));
+            validation.push(strict, "transition_level_missing", error);
+            if strict {
                 load_state.status = LdtkLoadStatus::Error;
-            } else {
-                validation.warnings.push(LdtkValidationIssue::warning(
-                    "transition_level_missing",
-                    error,
-                ));
             }
             continue;
         }
@@ -206,8 +219,7 @@ fn start_transition(
     catalog: &LdtkMapCatalog,
 ) -> Result<(), String> {
     let target_level_iid = catalog
-        .levels
-        .get(&target_level)
+        .level_by_id_or_iid(&target_level)
         .map(|info| info.iid.clone())
         .ok_or_else(|| format!("Level '{target_level}' not found in LdtkMapCatalog"))?;
 
@@ -267,22 +279,14 @@ fn finalize_level_transition(
         ) {
             Ok(spawn) => spawn,
             Err(message) => {
+                let strict = resources.strict_config.strict_validation;
                 resources.state.status = LevelTransitionStatus::Failed;
                 resources.state.error = Some(message.clone());
-                if resources.strict_config.strict_validation {
-                    resources.validation.errors.push(LdtkValidationIssue::error(
-                        "transition_spawn_missing",
-                        message.clone(),
-                    ));
+                resources
+                    .validation
+                    .push(strict, "transition_spawn_missing", message);
+                if strict {
                     resources.load_state.status = LdtkLoadStatus::Error;
-                } else {
-                    resources
-                        .validation
-                        .warnings
-                        .push(LdtkValidationIssue::warning(
-                            "transition_spawn_missing",
-                            message.clone(),
-                        ));
                 }
                 resources.pending.target_level = None;
                 return;
@@ -417,11 +421,7 @@ fn resolve_spawn_point(
 }
 
 fn level_identifier_from_iid(catalog: &LdtkMapCatalog, iid: &str) -> Option<String> {
-    catalog
-        .levels
-        .values()
-        .find(|info| info.iid == iid)
-        .map(|info| info.identifier.clone())
+    catalog.identifier_for_iid(iid).map(ToOwned::to_owned)
 }
 
 #[cfg(feature = "tilemap")]
@@ -515,13 +515,11 @@ fn attach_tile_animators_to_tiles(
 
 #[cfg(feature = "tilemap")]
 fn resolve_level_iid_from_metadata(catalog: &LdtkMapCatalog, level_id: &str) -> String {
-    if let Some(level) = catalog.levels.values().find(|level| level.iid == level_id) {
-        return level.iid.clone();
-    }
-    if let Some(level) = catalog.levels.get(level_id) {
-        return level.iid.clone();
-    }
-    level_id.to_string()
+    // `level_id` may already be an iid, or an identifier we need to translate.
+    catalog
+        .level_by_id_or_iid(level_id)
+        .map(|level| level.iid.clone())
+        .unwrap_or_else(|| level_id.to_string())
 }
 
 #[cfg(feature = "tilemap")]
@@ -565,7 +563,7 @@ mod tests {
                 layer_identifier: "Entities".to_string(),
             },
         ];
-        catalog.levels.insert(level.identifier.clone(), level);
+        catalog.insert_level_info(level);
         catalog
     }
 
@@ -595,7 +593,7 @@ mod tests {
         let mut catalog = LdtkMapCatalog::default();
         let mut level = LdtkLevelInfo::default();
         level.identifier = "Level_A".to_string();
-        catalog.levels.insert(level.identifier.clone(), level);
+        catalog.insert_level_info(level);
 
         let result = resolve_spawn_point(
             &catalog,
@@ -702,7 +700,7 @@ mod tests {
         let mut catalog = LdtkMapCatalog::default();
         let mut level = LdtkLevelInfo::default();
         level.identifier = "Level_A".to_string();
-        catalog.levels.insert(level.identifier.clone(), level);
+        catalog.insert_level_info(level);
 
         let mut config = LdtkLevelManagerConfig::default();
         config.allow_missing_spawnpoints = true;

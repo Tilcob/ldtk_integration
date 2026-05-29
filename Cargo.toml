@@ -10,5 +10,9 @@ bevy_ecs_tilemap = { version = "0.18.1", optional = true }
 serde_json = "1"
 
 [features]
-default = ["tilemap"]
+default = ["tilemap", "external-level-fs"]
 tilemap = ["bevy_ecs_tilemap"]
+# Enables the filesystem-backed loader for external `.ldtkl` levels. Disable on
+# targets without synchronous file access (e.g. WASM) and supply a custom
+# `LdtkExternalLevelSource` instead.
+external-level-fs = []
