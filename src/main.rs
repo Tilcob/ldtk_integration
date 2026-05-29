@@ -10,10 +10,7 @@ fn main() {
 }
 
 fn setup_camera(mut commands: Commands<'_, '_>) {
-    commands.spawn((
-        Camera2d,
-        Name::new("Main 2D Camera"),
-    ));
+    commands.spawn((Camera2d, Name::new("Main 2D Camera")));
 }
 
 fn bootstrap_ldtk_world(mut commands: Commands<'_, '_>) {
