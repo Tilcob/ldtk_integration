@@ -2,6 +2,23 @@
 name = "ldtk_integration"
 version = "0.1.0"
 edition = "2024"
+description = "A Bevy plugin for LDtk level loading: world catalog, entity registration, collision, and level transitions."
+license = "MIT OR Apache-2.0"
+authors = ["Jakob Dorninger"]
+repository = "https://github.com/jakobdorninger/ldtk_integration"
+keywords = ["bevy", "ldtk", "gamedev", "2d", "levels"]
+categories = ["game-engines"]
+readme = "README.md"
+exclude = ["assets/", ".idea/"]
+
+[lib]
+name = "ldtk_integration"
+path = "src/lib.rs"
+
+# The demo binary is kept for local testing and is not part of the library.
+[[bin]]
+name = "ldtk_demo"
+path = "src/main.rs"
 
 [dependencies]
 bevy = "0.18.1"
@@ -12,7 +29,7 @@ serde_json = "1"
 [features]
 default = ["tilemap", "external-level-fs"]
 tilemap = ["bevy_ecs_tilemap"]
-# Enables the filesystem-backed loader for external `.ldtkl` levels. Disable on
-# targets without synchronous file access (e.g. WASM) and supply a custom
-# `LdtkExternalLevelSource` instead.
+# Enables the filesystem-backed loader for external `.ldtkl` level files.
+# Disable on targets without synchronous filesystem access (e.g. WASM) and
+# supply a custom [`LdtkExternalLevelSource`] resource instead.
 external-level-fs = []
