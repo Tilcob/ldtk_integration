@@ -35,7 +35,7 @@ bevy = "0.18.1"
 Per Git:
 
 ```toml
-ldtk_integration = { git = "https://github.com/<user>/ldtk_integration.git" }
+ldtk_integration = { git = "https://github.com/Tilcob/ldtk_integration.git" }
 ```
 
 ---
