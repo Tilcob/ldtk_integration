@@ -439,6 +439,45 @@ pub struct LdtkCollisionCatalog {
     pub cells: Vec<LdtkCollisionCell>,
 }
 
+impl LdtkCollisionCatalog {
+    /// World-space center of a collision cell, in the same Bevy y-up coordinate
+    /// space as rendered tiles and [`LdtkSpawnPoint::position`] (Feature 4).
+    ///
+    /// Needs the [`LdtkMapCatalog`] to look up the cell's level (world origin and
+    /// height) and layer (grid size). Returns `None` when either is missing or
+    /// the layer has a non-positive grid size.
+    ///
+    /// `GridCoords` are y-up with the origin at the level's bottom-left, so with
+    /// the level's Bevy origin at `(world_x, -world_y - px_hei)` the cell center
+    /// is `origin + ((gx + 0.5) * grid, (gy + 0.5) * grid)`. This mirrors the
+    /// pixel→world conversion used for spawn points, so colliders, tiles, and
+    /// gameplay distances all share one convention.
+    pub fn cell_world_center(
+        &self,
+        cell: &LdtkCollisionCell,
+        map: &LdtkMapCatalog,
+    ) -> Option<Vec2> {
+        let level = map.level_by_id_or_iid(&cell.level_identifier)?;
+        let layer = map.layers.get(&cell.layer_iid)?;
+        if layer.grid_size <= 0 {
+            return None;
+        }
+
+        let grid = layer.grid_size as f32;
+        let origin = Vec2::new(
+            level.world_position.x as f32,
+            -(level.world_position.y as f32) - level.size.y as f32,
+        );
+        Some(
+            origin
+                + Vec2::new(
+                    (cell.grid_position.x as f32 + 0.5) * grid,
+                    (cell.grid_position.y as f32 + 0.5) * grid,
+                ),
+        )
+    }
+}
+
 /// Strongly typed mirror of `bevy_ecs_ldtk`'s layer kind, so consumers match on
 /// a stable enum instead of a `format!("{:?}", ...)` debug string that silently
 /// breaks if the upstream `Debug` impl changes.
@@ -1420,6 +1459,49 @@ mod tests {
         assert!(config.should_include_layer("Ground"));
         assert!(!config.should_include_layer("Background"));
         assert!(!config.should_include_layer("Debug"));
+    }
+
+    #[test]
+    fn collision_cell_world_center_matches_spawn_convention() {
+        let mut map = LdtkMapCatalog::default();
+        map.insert_level_info(LdtkLevelInfo {
+            iid: "lvl-iid".to_string(),
+            identifier: "Level_A".to_string(),
+            size: IVec2::new(256, 128),
+            world_position: IVec2::new(0, 0),
+            ..Default::default()
+        });
+        map.layers.insert(
+            "layer-iid".to_string(),
+            LdtkLayerInfo {
+                iid: "layer-iid".to_string(),
+                grid_size: 16,
+                ..Default::default()
+            },
+        );
+
+        let catalog = LdtkCollisionCatalog::default();
+        let cell = LdtkCollisionCell {
+            level_identifier: "Level_A".to_string(),
+            layer_iid: "layer-iid".to_string(),
+            grid_position: IVec2::new(0, 0),
+            ..Default::default()
+        };
+
+        // Level origin (bottom-left) is (0, -0 - 128) = (0, -128); the bottom-left
+        // cell center sits half a grid cell in from there.
+        assert_eq!(
+            catalog.cell_world_center(&cell, &map),
+            Some(Vec2::new(8.0, -120.0))
+        );
+
+        // A cell whose layer is not in the catalog resolves to None.
+        let orphan = LdtkCollisionCell {
+            level_identifier: "Level_A".to_string(),
+            layer_iid: "missing".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(catalog.cell_world_center(&orphan, &map), None);
     }
 
     #[test]

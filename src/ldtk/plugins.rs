@@ -107,6 +107,8 @@ fn process_ldtk_commands(
     mut runtime: ResMut<'_, LdtkRuntimeState>,
     mut load_state: ResMut<'_, LdtkLoadState>,
     mut selection: ResMut<'_, LevelSelection>,
+    mut collision_catalog: ResMut<'_, LdtkCollisionCatalog>,
+    mut entity_catalog: ResMut<'_, LdtkEntityCatalog>,
     mut level_messages: MessageWriter<'_, LdtkLevelActivatedEvent>,
     mut unload_messages: MessageWriter<'_, LdtkWorldUnloadedEvent>,
 ) {
@@ -147,6 +149,11 @@ fn process_ldtk_commands(
                 load_state.errors.clear();
                 load_state.stats = LdtkLoadStats::default();
                 *selection = LevelSelection::default();
+                // The collision/entity catalogs are populated from `Added<...>`
+                // queries as levels (re)spawn. Without clearing them here every
+                // (re)spawn would append duplicate, ever-growing data (Bug 2,
+                // Fix A). Covers SpawnWorld and, via queue_spawn_world, ReloadWorld.
+                clear_runtime_catalogs(&mut collision_catalog, &mut entity_catalog);
             }
             LdtkCommand::ChangeLevel { level_identifier } => {
                 runtime.active_level = Some(level_identifier.clone());
@@ -171,10 +178,24 @@ fn process_ldtk_commands(
                 load_state.world_identifier = None;
                 load_state.stats = LdtkLoadStats::default();
                 *selection = LevelSelection::default();
+                clear_runtime_catalogs(&mut collision_catalog, &mut entity_catalog);
                 unload_messages.write(LdtkWorldUnloadedEvent);
             }
         }
     }
+}
+
+/// Empties the runtime collision and entity catalogs. Called whenever a world is
+/// spawned, reloaded, or unloaded so that the `Added<...>`-driven capture systems
+/// rebuild from scratch instead of accumulating stale rows (Bug 2).
+fn clear_runtime_catalogs(
+    collision_catalog: &mut LdtkCollisionCatalog,
+    entity_catalog: &mut LdtkEntityCatalog,
+) {
+    collision_catalog.cells.clear();
+    collision_catalog.layers.clear();
+    entity_catalog.by_iid.clear();
+    entity_catalog.snapshots.clear();
 }
 
 fn queue_spawn_world(commands: &mut Commands<'_, '_>, world_path: String) {
@@ -593,6 +614,23 @@ fn direction_by_world_position(source: &Level, target: &Level) -> Option<LdtkDir
     }
 }
 
+/// Converts an LDtk pixel coordinate (relative to the level's top-left, y-down)
+/// into a Bevy world position (y-up), matching how `bevy_ecs_ldtk` places levels
+/// under `LevelSpawnBehavior::UseWorldTranslation` (Bug 1).
+///
+/// LDtk stores entity `px` and a level's `world_x`/`world_y` y-down; Bevy renders
+/// y-up. A level's Bevy origin (its bottom-left corner) sits at
+/// `(world_x, -world_y - px_hei)`, and a point `px` inside the level maps to the
+/// level-local offset `(px.x, px_hei - px.y)`. Summing the two collapses the
+/// level height out entirely, leaving `(world_x + px.x, -(world_y + px.y))`, so a
+/// player teleported here lands exactly on the rendered entity.
+fn ldtk_px_to_world(px: IVec2, level_world: IVec2) -> Vec2 {
+    Vec2::new(
+        (level_world.x + px.x) as f32,
+        -((level_world.y + px.y) as f32),
+    )
+}
+
 fn extract_spawn_points(
     level: &Level,
     layer: &LayerInstance,
@@ -617,7 +655,7 @@ fn extract_spawn_points(
 
             LdtkSpawnPoint {
                 identifier: entity.identifier.clone(),
-                position: Vec2::new(entity.px.x as f32, entity.px.y as f32),
+                position: ldtk_px_to_world(entity.px, IVec2::new(level.world_x, level.world_y)),
                 level_identifier: level.identifier.clone(),
                 layer_identifier: layer.identifier.clone(),
                 tags,
@@ -744,7 +782,7 @@ fn extract_entity_snapshots(
                 world_identifier: Some(world_identifier.to_string()),
                 level_identifier: Some(level.identifier.clone()),
                 layer_identifier: Some(layer.identifier.clone()),
-                position: Vec2::new(entity.px.x as f32, entity.px.y as f32),
+                position: ldtk_px_to_world(entity.px, IVec2::new(level.world_x, level.world_y)),
                 grid_position: entity.grid,
                 size: Vec2::new(entity.width as f32, entity.height as f32),
                 pivot: entity.pivot,
@@ -1019,6 +1057,9 @@ fn apply_registered_entity_behaviors(
 fn sync_level_lifecycle_events(
     mut events: MessageReader<'_, '_, LevelEvent>,
     mut runtime: ResMut<'_, LdtkRuntimeState>,
+    catalog: Res<'_, LdtkMapCatalog>,
+    mut collision_catalog: ResMut<'_, LdtkCollisionCatalog>,
+    mut entity_catalog: ResMut<'_, LdtkEntityCatalog>,
 ) {
     for event in events.read() {
         match event {
@@ -1026,7 +1067,27 @@ fn sync_level_lifecycle_events(
                 runtime.loaded_levels.insert(level_iid.as_str().to_string());
             }
             LevelEvent::Despawned(level_iid) => {
-                runtime.loaded_levels.remove(level_iid.as_str());
+                let iid = level_iid.as_str();
+                runtime.loaded_levels.remove(iid);
+
+                // Drop this level's catalog data so neighbor streaming
+                // (load/unload of adjacent levels) cannot accumulate stale
+                // colliders or dangling entity handles (Bug 2, Fix B).
+                collision_catalog.cells.retain(|cell| cell.level_iid != iid);
+                collision_catalog
+                    .layers
+                    .retain(|_, info| info.level_iid != iid);
+
+                if let Some(identifier) = catalog.identifier_for_iid(iid).map(str::to_owned) {
+                    entity_catalog.snapshots.retain(|_, snapshot| {
+                        snapshot.level_identifier.as_deref() != Some(identifier.as_str())
+                    });
+                    let live: std::collections::HashSet<String> =
+                        entity_catalog.snapshots.keys().cloned().collect();
+                    entity_catalog
+                        .by_iid
+                        .retain(|entity_iid, _| live.contains(entity_iid));
+                }
             }
             LevelEvent::SpawnTriggered(_) | LevelEvent::Transformed(_) => {}
         }
@@ -1175,6 +1236,20 @@ mod tests {
         };
 
         assert_eq!(tile_id_from_rect(&rect, &tileset), Some(6));
+    }
+
+    #[test]
+    fn converts_ldtk_pixels_to_bevy_world_y_up() {
+        // Level at the world origin: x is unchanged, y is simply flipped.
+        assert_eq!(
+            ldtk_px_to_world(IVec2::new(32, 48), IVec2::ZERO),
+            Vec2::new(32.0, -48.0)
+        );
+        // Level offset in world space: both axes shift, y stays flipped.
+        assert_eq!(
+            ldtk_px_to_world(IVec2::new(10, 20), IVec2::new(256, 128)),
+            Vec2::new(266.0, -148.0)
+        );
     }
 
     #[test]

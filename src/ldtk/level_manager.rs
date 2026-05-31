@@ -35,7 +35,11 @@ impl Plugin for LevelManagerPlugin {
             .add_systems(Startup, check_loader_dependency)
             .add_systems(
                 Update,
-                (handle_transition_requests, finalize_level_transition)
+                (
+                    request_initial_level_transition,
+                    handle_transition_requests,
+                    finalize_level_transition,
+                )
                     .chain()
                     .in_set(LdtkLoadSet::LevelTransitions)
                     .run_if(resource_exists::<LdtkRuntimeState>),
@@ -180,6 +184,45 @@ struct TransitionResources<'w> {
     validation: ResMut<'w, LdtkValidationReport>,
 }
 
+/// Auto-promotes the first level that `bevy_ecs_ldtk` spawns into a full level
+/// transition when nothing else has driven one yet (Bug 3). Without this, a
+/// world loaded via `LdtkConfig::with_world_asset_path(..)` — or a bare
+/// `change_ldtk_level(..)` — would render but never place the player, set
+/// `CurrentLdtkLevel`, or fire `LdtkLevelReadyEvent` / `LdtkCollisionReadyEvent`,
+/// so a single-level game would start with nothing wired up.
+///
+/// Runs only while idle (no current level and no pending transition) so it never
+/// competes with an explicit `transition_to_ldtk_level` request. The emitted
+/// request is picked up by `handle_transition_requests` in the same frame, and
+/// `finalize_level_transition` completes it against the same `Spawned` event.
+fn request_initial_level_transition(
+    mut events: MessageReader<'_, '_, LevelEvent>,
+    current: Res<'_, CurrentLdtkLevel>,
+    pending: Res<'_, PendingLdtkLevelTransition>,
+    catalog: Res<'_, LdtkMapCatalog>,
+    mut requests: MessageWriter<'_, LevelTransitionRequest>,
+) {
+    let idle = current.identifier.is_none() && pending.target_level.is_none();
+    let mut requested = false;
+    for event in events.read() {
+        // Drain every event so the reader cursor stays current even when idle is
+        // false; only the first resolvable spawn triggers a request.
+        let LevelEvent::Spawned(level_iid) = event else {
+            continue;
+        };
+        if !idle || requested {
+            continue;
+        }
+        if let Some(identifier) = catalog.identifier_for_iid(level_iid.as_str()) {
+            requests.write(LevelTransitionRequest {
+                target_level: identifier.to_string(),
+                spawn_id: None,
+            });
+            requested = true;
+        }
+    }
+}
+
 fn handle_transition_requests(
     mut requests: MessageReader<'_, '_, LevelTransitionRequest>,
     mut selection: ResMut<'_, LevelSelection>,
@@ -289,6 +332,8 @@ fn finalize_level_transition(
                     resources.load_state.status = LdtkLoadStatus::Error;
                 }
                 resources.pending.target_level = None;
+                resources.pending.target_level_iid = None;
+                resources.pending.spawn_id = None;
                 return;
             }
         };
@@ -299,24 +344,48 @@ fn finalize_level_transition(
             }
         }
 
+        // Capture the spawn id before clearing `pending` (Bug 4): the ready event
+        // below still needs it, but every `pending` field must be reset so a
+        // second `Spawned` event in the same frame (neighbor streaming) cannot
+        // re-match a stale `target_level_iid`/`spawn_id` and teleport twice.
+        let spawn_id = resources.pending.spawn_id.clone();
         resources.current.identifier = Some(level_identifier.clone());
         resources.current.iid = Some(level_iid.clone());
         resources.runtime.active_level = Some(level_identifier.clone());
         resources.state.status = LevelTransitionStatus::Ready;
         resources.state.error = None;
         resources.pending.target_level = None;
+        resources.pending.target_level_iid = None;
+        resources.pending.spawn_id = None;
 
-        let player_entity = locator.entity.or_else(|| player_query.iter().next());
-        if let Some(entity) = player_entity {
-            if let Ok(mut transform) = transform_query.get_mut(entity) {
+        // Teleport the player to the resolved spawn point. Prefer the explicit
+        // locator entity, fall back to the first `LdtkLevelPlayer`, and warn
+        // loudly if neither resolves to a live Transform (Bug 5) instead of
+        // silently leaving the player in place.
+        let player_entity = locator
+            .entity
+            .filter(|&entity| transform_query.contains(entity))
+            .or_else(|| {
+                player_query
+                    .iter()
+                    .find(|&entity| transform_query.contains(entity))
+            });
+        match player_entity.and_then(|entity| transform_query.get_mut(entity).ok()) {
+            Some(mut transform) => {
                 transform.translation =
                     Vec3::new(spawn.position.x, spawn.position.y, transform.translation.z);
+            }
+            None => {
+                warn!(
+                    "No LdtkLevelPlayer/locator entity with a Transform found — \
+                     skipping teleport for level '{level_identifier}'."
+                );
             }
         }
 
         ready_messages.write(LdtkLevelReadyEvent {
             level_identifier: level_identifier.clone(),
-            spawn_id: resources.pending.spawn_id.clone(),
+            spawn_id,
             position: spawn.position,
         });
 
@@ -330,6 +399,10 @@ fn finalize_level_transition(
             level_identifier,
             cells: collision_cells,
         });
+
+        // One transition completes per finalize pass; stop so additional
+        // `Spawned` events this frame are not mistaken for this transition.
+        break;
     }
 }
 
@@ -380,8 +453,11 @@ fn resolve_spawn_point(
         .ok_or_else(|| format!("Level '{target_level}' not found in LdtkMapCatalog"))?;
 
     if let Some(spawn_id) = spawn_id {
+        // Identifier and tag matching are both case-insensitive so that
+        // `transition_to_ldtk_level("L", Some("playerspawn"))` resolves
+        // `PlayerSpawn` regardless of casing (Bug 6).
         let found = level.spawn_points.iter().find(|spawn| {
-            spawn.identifier == spawn_id
+            spawn.identifier.eq_ignore_ascii_case(spawn_id)
                 || spawn
                     .tags
                     .iter()
@@ -393,7 +469,9 @@ fn resolve_spawn_point(
     }
 
     let default_spawn = level.spawn_points.iter().find(|spawn| {
-        spawn.identifier == config.default_spawn_identifier
+        spawn
+            .identifier
+            .eq_ignore_ascii_case(&config.default_spawn_identifier)
             || spawn
                 .tags
                 .iter()
@@ -576,6 +654,22 @@ mod tests {
             resolve_spawn_point(&catalog, "Level_A", Some("Alt"), &config).expect("spawnpoint");
 
         assert_eq!(spawn.identifier, "Alt");
+    }
+
+    #[test]
+    fn resolves_spawn_id_case_insensitively() {
+        let catalog = build_catalog_with_spawnpoints();
+        let config = LdtkLevelManagerConfig::default();
+
+        // Lower-case query must resolve the `PlayerSpawn` identifier (Bug 6).
+        let spawn = resolve_spawn_point(&catalog, "Level_A", Some("playerspawn"), &config)
+            .expect("spawnpoint");
+        assert_eq!(spawn.identifier, "PlayerSpawn");
+
+        // And the alternate spawn by its identifier, also case-insensitively.
+        let alt =
+            resolve_spawn_point(&catalog, "Level_A", Some("ALT"), &config).expect("spawnpoint");
+        assert_eq!(alt.identifier, "Alt");
     }
 
     #[test]
