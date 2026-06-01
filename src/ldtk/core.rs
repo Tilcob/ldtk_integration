@@ -1236,6 +1236,13 @@ impl LdtkEntityRegistry {
             key,
             Box::new(
                 move |world: &mut World, entity: Entity, context: &LdtkEntitySpawnContext| {
+                    // NOTE: do NOT insert a `Transform` here. `bevy_ecs_ldtk`
+                    // already gives every entity instance the correct Y-up,
+                    // pivot-adjusted transform (see
+                    // `calculate_transform_from_entity_instance`). Overwriting it
+                    // with `context.position` (raw LDtk Y-down pixel coords)
+                    // mirrors the entity vertically and ignores the level's world
+                    // translation, placing it in the wrong spot.
                     world.entity_mut(entity).insert((
                         B::default(),
                         LdtkEntityMarker {
@@ -1243,8 +1250,6 @@ impl LdtkEntityRegistry {
                             level_identifier: context.level_identifier.clone(),
                             world_identifier: context.world_identifier.clone(),
                         },
-                        Transform::from_translation(context.position.extend(0.0)),
-                        GlobalTransform::default(),
                     ));
                 },
             ),
