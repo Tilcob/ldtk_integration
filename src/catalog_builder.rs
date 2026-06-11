@@ -241,6 +241,7 @@ fn level_with_external_data(
 fn level_info_from_level(level: &Level, world_identifier: &str) -> LdtkLevelInfo {
     LdtkLevelInfo {
         iid: level.iid.clone(),
+        uid: level.uid,
         identifier: level.identifier.clone(),
         world_identifier: world_identifier.to_string(),
         external_path: level.external_rel_path.clone(),

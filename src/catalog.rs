@@ -20,6 +20,11 @@ pub struct LdtkMapCatalog {
     /// iid are O(1) instead of a linear scan over [`Self::levels`]. Kept in sync
     /// by [`Self::insert_level_info`].
     pub levels_by_iid: HashMap<String, String>,
+    /// Secondary index mapping a level's numeric LDtk `uid` to its `identifier`.
+    /// `bevy_ecs_ldtk`'s `LayerMetadata::level_id` references levels by uid, so
+    /// runtime capture needs this to attribute layers/cells to a level. Kept in
+    /// sync by [`Self::insert_level_info`].
+    pub levels_by_uid: HashMap<i32, String>,
     /// Layer instances keyed by their LDtk instance **IID** (identifiers are not
     /// unique across levels, IIDs are).
     pub layers: HashMap<String, LdtkLayerInfo>,
@@ -40,11 +45,12 @@ impl LdtkMapCatalog {
         self.worlds.is_empty() && self.levels.is_empty()
     }
 
-    /// Inserts a level while keeping the `iid -> identifier` and
-    /// `entity iid -> snapshot` indexes in sync.
+    /// Inserts a level while keeping the `iid -> identifier`,
+    /// `uid -> identifier`, and `entity iid -> snapshot` indexes in sync.
     pub fn insert_level_info(&mut self, info: LdtkLevelInfo) {
         self.levels_by_iid
             .insert(info.iid.clone(), info.identifier.clone());
+        self.levels_by_uid.insert(info.uid, info.identifier.clone());
         for (index, entity) in info.entities.iter().enumerate() {
             self.entities_by_iid
                 .insert(entity.entity_iid.clone(), (info.identifier.clone(), index));
@@ -57,6 +63,7 @@ impl LdtkMapCatalog {
         self.worlds.clear();
         self.levels.clear();
         self.levels_by_iid.clear();
+        self.levels_by_uid.clear();
         self.layers.clear();
         self.tilesets.clear();
         self.tile_animations.clear();
@@ -75,6 +82,14 @@ impl LdtkMapCatalog {
         }
         self.levels_by_iid
             .get(id)
+            .and_then(|identifier| self.levels.get(identifier))
+    }
+
+    /// Looks up a level by its numeric LDtk `uid` in O(1) via
+    /// [`Self::levels_by_uid`].
+    pub fn level_by_uid(&self, uid: i32) -> Option<&LdtkLevelInfo> {
+        self.levels_by_uid
+            .get(&uid)
             .and_then(|identifier| self.levels.get(identifier))
     }
 
@@ -245,6 +260,9 @@ pub struct LdtkWorldInfo {
 pub struct LdtkLevelInfo {
     /// Instance-unique identifier for this level.
     pub iid: String,
+    /// Numeric LDtk UID for this level; `LayerMetadata::level_id` references
+    /// levels by this value at runtime.
+    pub uid: i32,
     /// Human-readable LDtk identifier for this level.
     pub identifier: String,
     /// Identifier of the world this level belongs to.
